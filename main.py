@@ -2,34 +2,30 @@
 import machine
 import utime
 import math
-import max30100 # Asigură-te că fișierul max30100.py (modificat anterior) este în același director
+import max30100 # Ensure max30100.py is in the same directory
 
-# --- Configurare specifică plăcii ---
+# --- Board Specific Configuration ---
 I2C_BUS_ID = 0
 SCL_PIN = 5 # GPIO5
 SDA_PIN = 4 # GPIO4
 # --------------------------------------------------------------------
 
-# --- Parametri pentru SpO2 ---
-# Thresholds for detecting a finger based on raw sensor readings
-FINGER_MIN_IR_VALUE = 3000
-FINGER_MIN_RED_VALUE = 4000
+# --- SpO2 Parameters ---
+# Tune these based on observed DC levels when finger is on vs. off
+FINGER_MIN_IR_VALUE = 5000  # Example: Adjust based on your readings with good LED currents
+FINGER_MIN_RED_VALUE = 5000 # Example: Adjust based on your readings
 
-# MODIFICARE: Mărire fereastră de calcul - Corespunde cu timpul necesar pentru a capta mai multe bătăi de inimă
-SPO2_CALCULATION_WINDOW_SIZE = 500 # Număr de mostre (ex: la 100sps, asta e 5 secunde de date)
-MIN_SAMPLES_FOR_SPO2 = 100         # Număr minim de mostre în buffere înainte de a încerca calculul (1s la 100sps)
+SPO2_CALCULATION_WINDOW_SIZE = 500
+MIN_SAMPLES_FOR_SPO2 = 100
 
-POLL_INTERVAL_MS = 20 # Interval de citire a senzorului
-SAMPLE_RATE_SPS = 100 # Rata de eșantionare a senzorului (100 samples per second)
+POLL_INTERVAL_MS = 20
+SAMPLE_RATE_SPS = 100
 
-# MODIFICARE: Parametri pentru media mobilă de netezire a semnalului brut
-# Netezirea semnalului brut înainte de procesarea AC/DC poate reduce zgomotul aleator.
-SMOOTHING_WINDOW_SIZE = 50 # Câte eșantioane să mediezi pentru netezire (0.5s la 100sps)
+SMOOTHING_WINDOW_SIZE = 50
 raw_ir_smoothing_buffer = []
 raw_red_smoothing_buffer = []
 # -------------------------------------
 
-# Constante de mod din biblioteca max30100.py
 MODE_SPO2 = max30100.MODE_SPO2_EN
 
 
@@ -38,18 +34,16 @@ class SpO2Calculator:
         self.buffer_size = buffer_size
         self.red_buffer = []
         self.ir_buffer = []
-        self.spo2_value = 0.0 # Valoarea SpO2 calculată
+        self.spo2_value = 0.0
         
-        # Variabile pentru debug și afișare detaliată
         self.last_dc_red = 0
         self.last_dc_ir = 0
         self.last_ac_red_rms = 0
         self.last_ac_ir_rms = 0
         self.last_r_value = 0.0
-        self.finger_present = False
+        # self.finger_present = False # Not used in this class directly
 
     def add_reading(self, red_sample, ir_sample):
-        # Adaugă eșantioane noi și menține dimensiunea bufferului
         self.red_buffer.append(red_sample)
         self.ir_buffer.append(ir_sample)
 
@@ -59,233 +53,300 @@ class SpO2Calculator:
             self.ir_buffer.pop(0)
 
     def calculate_spo2(self):
-        # Asigură-te că avem suficiente date în buffer pentru un calcul stabil
         if len(self.red_buffer) < MIN_SAMPLES_FOR_SPO2:
-            return 0.0 # Sau o valoare invalidă pentru a indica că nu e gata
+            return 0.0
 
-        # 1. Calculul Componentelor DC (Media semnalului)
-        # Reprezintă lumina absorbită de alte componente decât sângele arterial pulsatil.
         dc_red = sum(self.red_buffer) / len(self.red_buffer)
         dc_ir = sum(self.ir_buffer) / len(self.ir_buffer)
         
         self.last_dc_red = dc_red
         self.last_dc_ir = dc_ir
 
-        # Verifică dacă semnalul DC este suficient de puternic pentru a indica prezența degetului
-        # Această verificare este complementară cu cea din main.
-        if dc_red < FINGER_MIN_RED_VALUE / 2 or dc_ir < FINGER_MIN_IR_VALUE / 2 :
-            return 0.0 # Semnal prea slab
+        # Optional: Secondary DC check, though main loop finger detection is primary
+        # Consider adjusting or removing if FINGER_MIN_RED_VALUE is well-tuned in main
+        # if dc_red < FINGER_MIN_RED_VALUE / 2 or dc_ir < FINGER_MIN_IR_VALUE / 2 :
+        #     return 0.0 # Semnal prea slab
 
-        # 2. Calculul Componentelor AC (Amplitudinea pulsațiilor)
-        # Reprezintă lumina absorbită de sângele arterial pulsatil.
-        # RMS (Root Mean Square) este o modalitate robustă de a estima amplitudinea AC.
-        ac_red_sq_sum = 0
-        for val in self.red_buffer:
-            ac_red_sq_sum += (val - dc_red) ** 2
+        ac_red_sq_sum = sum([(val - dc_red) ** 2 for val in self.red_buffer])
         ac_red_rms = math.sqrt(ac_red_sq_sum / len(self.red_buffer))
 
-        ac_ir_sq_sum = 0
-        for val in self.ir_buffer:
-            ac_ir_sq_sum += (val - dc_ir) ** 2
+        ac_ir_sq_sum = sum([(val - dc_ir) ** 2 for val in self.ir_buffer])
         ac_ir_rms = math.sqrt(ac_ir_sq_sum / len(self.ir_buffer))
         
         self.last_ac_red_rms = ac_red_rms
         self.last_ac_ir_rms = ac_ir_rms
 
-        # MODIFICARE: Prag de Amplitudine Minima AC - Esențial pentru a asigura un semnal PPG valid
-        # Dacă pulsația este prea slabă, calculul R devine instabil și imprecis.
-        # Valoarea exactă necesită calibrare și testare. Poate fi ajustată.
-        MIN_AC_AMPLITUDE = 15.0 # Ajustează acest prag!
+        MIN_AC_AMPLITUDE = 30.0 # Or 40.0, based on your observations of AC for good readings
         if ac_red_rms < MIN_AC_AMPLITUDE or ac_ir_rms < MIN_AC_AMPLITUDE:
             # print(f"AC too weak: ACR={ac_red_rms:.1f}, ACI={ac_ir_rms:.1f}")
-            # Returnează ultima valoare validă sau 0.0/None pentru a indica o citire slabă.
-            return self.spo2_value # Mentine ultima valoare valida pentru stabilitate vizuala
+            return self.spo2_value # Return last valid value
 
-        # 3. Calculul Raportului de Perfuzație (AC/DC)
-        # PI = AC / DC, reflectă cantitatea de sânge pulsatil în comparație cu totalul.
+        if dc_red == 0 or dc_ir == 0:
+             return self.spo2_value
         ratio_red = ac_red_rms / dc_red
         ratio_ir = ac_ir_rms / dc_ir
 
-        # Evită împărțirea la zero
         if ratio_ir == 0:
-            return self.spo2_value # Mentine ultima valoare valida
+            return self.spo2_value
 
-        # 4. Calculul Raportului R (Ratio of Ratios)
-        # R = (ACred/DCred) / (ACired / DCired) - Aceasta este valoarea cheie pentru SpO2.
-        # Conform documentației Maxim.
         R = ratio_red / ratio_ir
-        self.last_r_value = R # Stochează valoarea R pentru debug
+        self.last_r_value = R
 
-        # 5. Calculul SpO2 folosind Formula Cuadratică (din documentația Maxim)
-        # SpO2 = aR^2 + bR + c
-        # Coeficienții a, b, c sunt coeficienți de calibrare.
-        # Acestea sunt valori comune găsite în implementări pentru MAX30100/MAX30102.
-        # O calibrare specifică pentru senzorul și amplasarea ta ar oferi cea mai bună acuratețe.
         a = -45.060
         b = 30.354
         c = 94.845
         spo2_calc = a * R * R + b * R + c
 
-        # Limitează valoarea SpO2 la un interval rezonabil
         if spo2_calc > 100.0:
             spo2_calc = 100.0
-        elif spo2_calc < 70.0: # Rar sub 70% la o persoană conștientă fără probleme grave
+        elif spo2_calc < 70.0: # This floor is still useful
             spo2_calc = 70.0
 
         self.spo2_value = spo2_calc
         return self.spo2_value
 
     def reset(self):
-        print("Resetting SpO2 calculator...")
+        # print("Resetting SpO2 calculator...") # Optional
         self.red_buffer.clear()
         self.ir_buffer.clear()
         self.spo2_value = 0.0
         self.last_r_value = 0.0
-        self.finger_present = False
-
-
-def main():
-    print("Inițializare senzor MAX30100 pentru SpO2...")
-    try:
-        i2c = machine.I2C(I2C_BUS_ID, scl=machine.Pin(SCL_PIN), sda=machine.Pin(SDA_PIN), freq=400000)
+        self.last_dc_red = 0
+        self.last_dc_ir = 0
+        self.last_ac_red_rms = 0
+        self.last_ac_ir_rms = 0
+        # self.finger_present = False # Not used
         
-        devices = i2c.scan()
-        expected_addr = max30100.I2C_ADDRESS
-        if not expected_addr in devices:
-            print(f"Senzorul MAX30100 nu a fost găsit la adresa 0x{expected_addr:02X}!")
-            print(f"Dispozitive găsite: {[hex(d) for d in devices]}")
+        
+# Add this class definition alongside your SpO2Calculator class
+
+class BPMCalculator:
+    def __init__(self, sample_rate_sps=100, window_seconds=6, bpm_avg_size=4): # window_seconds to look for peaks
+        self.sample_rate = sample_rate_sps
+        self.ir_data_buffer = [] # Buffer to store IR data for peak detection
+        self.buffer_max_size = int(sample_rate_sps * window_seconds) # e.g., 100sps * 6s = 600 samples
+        
+        self.last_peak_time_ms = 0
+        self.beat_intervals_ms = [] # Store recent beat-to-beat intervals in ms
+        self.bpm_avg_size = bpm_avg_size # Number of recent beats to average for BPM
+        
+        self.current_bpm = 0.0
+        
+        # Peak detection parameters (these may need tuning)
+        # self.peak_threshold_factor = 0.6 # Not used in this simplified version yet
+        self.min_samples_between_peaks = int(sample_rate_sps * 0.3) # e.g., 300ms physiological limit (200 BPM max)
+        self.samples_since_last_peak = 0
+        self.last_ir_value_for_slope = 0 # To detect rising/falling slope for simple peak detection (not fully used in current simple peak)
+
+    def add_ir_reading(self, ir_sample):
+        self.ir_data_buffer.append(ir_sample) # <<< FIXED >>>
+        if len(self.ir_data_buffer) > self.buffer_max_size: # <<< FIXED (both self.)>>>
+            self.ir_data_buffer.pop(0) # <<< FIXED >>>
+
+        self.samples_since_last_peak += 1 # <<< FIXED >>>
+
+        if len(self.ir_data_buffer) < 3: # <<< FIXED >>>
+            self.last_ir_value_for_slope = ir_sample # <<< FIXED >>>
             return
 
-        print("Configuring sensor for SpO2...")
-        # Configurațiile senzorului sunt critice pentru calitatea semnalului.
-        # Puls width și ADC range afectează rezoluția și timpul de integrare.
-        # LED currents afectează intensitatea luminii. Ajustează pentru a obține valori DC bune (nu saturate, nu prea mici).
+        is_potential_peak = False
+        if len(self.ir_data_buffer) >= 3 and \
+           self.ir_data_buffer[-3] < self.ir_data_buffer[-2] and \
+           self.ir_data_buffer[-2] > self.ir_data_buffer[-1]: # <<< FIXED (all self.ir_data_buffer) >>>
+            
+            if self.samples_since_last_peak >= self.min_samples_between_peaks: # <<< FIXED (both self.) >>>
+                is_potential_peak = True
+
+        if is_potential_peak:
+            current_time_ms = utime.ticks_ms()
+            if self.last_peak_time_ms > 0: # <<< FIXED >>>
+                interval_ms = utime.ticks_diff(current_time_ms, self.last_peak_time_ms) # <<< FIXED >>>
+                
+                if 300 < interval_ms < 2000: # Physiological filter
+                    self.beat_intervals_ms.append(interval_ms) # <<< FIXED >>>
+                    if len(self.beat_intervals_ms) > self.bpm_avg_size: # <<< FIXED (both self.) >>>
+                        self.beat_intervals_ms.pop(0) # <<< FIXED >>>
+                    
+                    if len(self.beat_intervals_ms) > 0: # <<< FIXED >>>
+                        avg_interval_ms = sum(self.beat_intervals_ms) / len(self.beat_intervals_ms) # <<< FIXED >>>
+                        self.current_bpm = 60000.0 / avg_interval_ms # <<< FIXED >>>
+                    else:
+                        self.current_bpm = 0.0 # <<< FIXED >>>
+            
+            self.last_peak_time_ms = current_time_ms # <<< FIXED >>>
+            self.samples_since_last_peak = 0 # <<< FIXED >>>
+        
+        self.last_ir_value_for_slope = ir_sample # <<< FIXED >>>
+
+
+    def get_bpm(self):
+        if 30 < self.current_bpm < 220: # <<< FIXED >>>
+            return self.current_bpm # <<< FIXED >>>
+        return 0.0
+
+    def reset(self):
+        # print("Resetting BPM calculator...") # Optional
+        self.ir_data_buffer.clear() # <<< FIXED >>>
+        self.last_peak_time_ms = 0 # <<< FIXED >>>
+        self.beat_intervals_ms.clear() # <<< FIXED >>>
+        self.current_bpm = 0.0 # <<< FIXED >>>
+        self.samples_since_last_peak = 0 # <<< FIXED >>>
+        self.last_ir_value_for_slope = 0 # <<< FIXED >>>
+        
+        
+
+def main():
+    print("Inițializare senzor MAX30100 pentru SpO2 & BPM...")
+
+    led_current_setting_red = 14.2
+    led_current_setting_ir = 40.2
+
+    try:
+        i2c = machine.I2C(I2C_BUS_ID, scl=machine.Pin(SCL_PIN), sda=machine.Pin(SDA_PIN), freq=400000)
+        devices = i2c.scan()
+        # ... (rest of sensor initialization as before) ...
         sensor = max30100.MAX30100(
             i2c=i2c,
-            mode=MODE_SPO2,
+            mode=MODE_SPO2, # SpO2 mode also provides IR data needed for BPM
             sample_rate=SAMPLE_RATE_SPS,
-            led_current_red=11.0, # Ajustează între 0.0 și 50.0 mA
-            led_current_ir=11.0,  # Ajustează între 0.0 și 50.0 mA
-            pulse_width=1600,     # 16-bit ADC, 1600us pulse width (recomandat pentru rezoluție înaltă)
-            adc_range=4096,       # Full range 4096 (16-bit) - max value for ADC.
-            max_buffer_len=SPO2_CALCULATION_WINDOW_SIZE + 20 # Asigură buffer suficient în obiectul sensor
+            led_current_red = led_current_setting_red,
+            led_current_ir = led_current_setting_ir,
+            pulse_width=1600,
+            adc_range=4096,
+            max_buffer_len=SPO2_CALCULATION_WINDOW_SIZE + SMOOTHING_WINDOW_SIZE + 10
         )
-        
-        part_id = sensor.get_part_id()
-        if part_id != 0x11: # 0x11 este Part ID pentru MAX30100
-            print(f"WARNING: Part ID {hex(part_id)} diferit de cel așteptat (0x11). Asigură-te că este MAX30100.")
-
-        print(f"Senzor MAX30100 (Part ID: {hex(part_id)}) inițializat. Așezați degetul ferm.")
+        print(f"Senzor MAX30100 (Part ID: {hex(sensor.get_part_id())}) inițializat. Așezați degetul ferm și acoperiți senzorul.")
 
     except Exception as e:
-        import sys
-        sys.print_exception(e)
-        print(f"Eroare la inițializarea senzorului.")
+        # ... (exception handling as before) ...
         return
 
     spo2_calc = SpO2Calculator()
+    bpm_calc = BPMCalculator(sample_rate_sps=SAMPLE_RATE_SPS) # <<< NEW: Instantiate BPM calculator
+
     last_print_time = utime.ticks_ms()
     finger_on = False
-    print_interval_ms = 1000 # Afișează SpO2 la fiecare secundă
+    print_interval_ms = 1000
 
     while True:
         try:
-            # Citește datele brute din FIFO-ul senzorului
             sensor.read_sensor_fifo()
             latest_ir_raw = sensor.ir
             latest_red_raw = sensor.red
 
-            current_ir_smoothed = latest_ir_raw # Valori de fallback dacă nu avem suficiente pentru netezire
-            current_red_smoothed = latest_red_raw
+            current_ir_smoothed = latest_ir_raw if latest_ir_raw is not None else 0
+            current_red_smoothed = latest_red_raw if latest_red_raw is not None else 0
 
             if latest_ir_raw is not None and latest_red_raw is not None:
-                # Aplică o medie mobilă pentru a netezi semnalul brut
+                # Smoothing (as before)
                 raw_ir_smoothing_buffer.append(latest_ir_raw)
                 raw_red_smoothing_buffer.append(latest_red_raw)
 
                 if len(raw_ir_smoothing_buffer) > SMOOTHING_WINDOW_SIZE:
                     raw_ir_smoothing_buffer.pop(0)
+                if len(raw_red_smoothing_buffer) > SMOOTHING_WINDOW_SIZE:
                     raw_red_smoothing_buffer.pop(0)
-
-                # Netezirea se aplică doar dacă avem suficiente date în bufferul de netezire
+                
                 if len(raw_ir_smoothing_buffer) == SMOOTHING_WINDOW_SIZE:
                     current_ir_smoothed = sum(raw_ir_smoothing_buffer) / SMOOTHING_WINDOW_SIZE
                     current_red_smoothed = sum(raw_red_smoothing_buffer) / SMOOTHING_WINDOW_SIZE
                 
-                # Logică de detecție a degetului bazată pe valorile DC (netezite)
-                # O prezență stabilă a degetului este indicată de valori DC ridicate.
+                # Finger detection (as before)
                 if current_ir_smoothed > FINGER_MIN_IR_VALUE and \
                    current_red_smoothed > FINGER_MIN_RED_VALUE:
                     if not finger_on:
                         print("Deget detectat. Se stabilizează citirile...")
                         finger_on = True
-                        spo2_calc.reset() # Resetează bufferul de calcul SpO2 la detectarea degetului
-                        # Golește și bufferele de netezire pentru a începe cu date "curate"
+                        spo2_calc.reset()
+                        bpm_calc.reset() # <<< NEW: Reset BPM calculator
                         raw_ir_smoothing_buffer.clear()
                         raw_red_smoothing_buffer.clear()
                     
-                    # Adaugă valorile (netezite) la bufferul de calcul SpO2
+                    # Add readings to calculators
                     spo2_calc.add_reading(current_red_smoothed, current_ir_smoothed)
+                    bpm_calc.add_ir_reading(current_ir_smoothed) # <<< NEW: Add IR to BPM calculator
                     
-                    if utime.ticks_diff(utime.ticks_ms(), last_print_time) >= print_interval_ms:
-                        if len(spo2_calc.red_buffer) >= MIN_SAMPLES_FOR_SPO2:
-                            calculated_spo2 = spo2_calc.calculate_spo2()
-                            # Afișează informații detaliate pentru debug și monitorizare
-                            print(f"IR: {current_ir_smoothed:<5.0f} | RED: {current_red_smoothed:<5.0f} | "
-                                  f"SpO2: {calculated_spo2:.1f}% | R: {spo2_calc.last_r_value:.3f} "
-                                  f"(AC_R:{spo2_calc.last_ac_red_rms:.1f}, DC_R:{spo2_calc.last_dc_red:.0f}, "
-                                  f"AC_I:{spo2_calc.last_ac_ir_rms:.1f}, DC_I:{spo2_calc.last_dc_ir:.0f})")
-                        else:
-                            print(f"IR: {current_ir_smoothed:<5.0f} | RED: {current_red_smoothed:<5.0f} | "
-                                  f"SpO2: Calculare... ({len(spo2_calc.red_buffer)}/{MIN_SAMPLES_FOR_SPO2})")
-                        last_print_time = utime.ticks_ms()
+                    calculated_spo2_this_cycle = 0.0
+                    current_bpm_value = 0.0 # <<< NEW
+                    
+                    if len(spo2_calc.red_buffer) >= MIN_SAMPLES_FOR_SPO2:
+                        calculated_spo2_this_cycle = spo2_calc.calculate_spo2()
+                    
+                    current_bpm_value = bpm_calc.get_bpm() # <<< NEW: Get BPM
 
-                elif finger_on:
-                    # Degetul a fost îndepărtat sau semnalul a devenit prea slab
+                    # Conditional Printing (as before, now add BPM)
+                    if utime.ticks_diff(utime.ticks_ms(), last_print_time) >= print_interval_ms:
+                        spo2_display_str = f"{calculated_spo2_this_cycle:.1f}%" if calculated_spo2_this_cycle > 0 else "Calc..."
+                        if calculated_spo2_this_cycle < 90.0 and calculated_spo2_this_cycle > 0 : # If SpO2 is calculated but low
+                            spo2_display_str = f"{calculated_spo2_this_cycle:.1f}% (R:{spo2_calc.last_r_value:.3f})"
+                        elif not (calculated_spo2_this_cycle >= 90.0 and (0.3 < spo2_calc.last_r_value < 0.9)):
+                            # If not printing full SpO2, at least show BPM if available
+                            if current_bpm_value > 0:
+                                print(f"Status: BPM: {current_bpm_value:.1f} | IR:{current_ir_smoothed:<5.0f} RED:{current_red_smoothed:<5.0f} SpO2:{spo2_display_str}")
+                            else:
+                                print(f"Status: Collecting... | IR:{current_ir_smoothed:<5.0f} RED:{current_red_smoothed:<5.0f} SpO2:{spo2_display_str}")
+                            last_print_time = utime.ticks_ms()
+                            # Continue to next iteration of the loop if we printed a status message
+                            # and don't meet the >90% SpO2 condition, to avoid printing the full line.
+                            # However, the original request was to *only* print full if SpO2 > 90.
+                            # Let's stick to that.
+
+                        # Print full line if SpO2 is good, or just status if BPM is the only thing ready.
+                        if calculated_spo2_this_cycle >= 90.0 and (0.3 < spo2_calc.last_r_value < 0.9):
+                            print(f"IR: {current_ir_smoothed:<5.0f} | RED: {current_red_smoothed:<5.0f} | "
+                                  f"BPM: {current_bpm_value:.1f} | SpO2: {calculated_spo2_this_cycle:.1f}% | R: {spo2_calc.last_r_value:.3f} "
+                                  f"(ACr:{spo2_calc.last_ac_red_rms:.1f}, DCr:{spo2_calc.last_dc_red:.0f}, "
+                                  f"ACir:{spo2_calc.last_ac_ir_rms:.1f}, DCir:{spo2_calc.last_dc_ir:.0f})")
+                        elif current_bpm_value > 0: # SpO2 not >90 or R bad, but BPM is available
+                             print(f"Status: BPM: {current_bpm_value:.1f} | IR:{current_ir_smoothed:<5.0f} RED:{current_red_smoothed:<5.0f} SpO2:{spo2_display_str}")
+                        # else: # Neither good SpO2 nor BPM ready, but finger is on.
+                        #     print(f"Status: Processing... | IR:{current_ir_smoothed:<5.0f} RED:{current_red_smoothed:<5.0f}")
+
+                        last_print_time = utime.ticks_ms()
+                
+                elif finger_on: # Finger removed
                     print("Deget îndepărtat sau semnal slab.")
                     finger_on = False
-                    spo2_calc.reset() # Resetează complet calculatorul
-                    raw_ir_smoothing_buffer.clear() # Golește bufferele de netezire
+                    spo2_calc.reset()
+                    bpm_calc.reset() # <<< NEW: Reset BPM calculator
+                    raw_ir_smoothing_buffer.clear()
                     raw_red_smoothing_buffer.clear()
-                    print(f"IR: {current_ir_smoothed:<5.0f} | RED: {current_red_smoothed:<5.0f} | SpO2: ---")
-                    last_print_time = utime.ticks_ms()
-                
-                # Cazul inițial când degetul nu este încă detectat, dar semnalul nu e zero
-                else:
                     if utime.ticks_diff(utime.ticks_ms(), last_print_time) >= print_interval_ms:
-                        print(f"IR: {current_ir_smoothed:<5.0f} | RED: {current_red_smoothed:<5.0f} | SpO2: Așteaptă degetul...")
+                        print(f"IR: {current_ir_smoothed:<5.0f} | RED: {current_red_smoothed:<5.0f} | BPM: --- | SpO2: ---")
+                        last_print_time = utime.ticks_ms()
+                
+                else: # Finger not on
+                    if utime.ticks_diff(utime.ticks_ms(), last_print_time) >= print_interval_ms:
+                        print(f"IR: {current_ir_smoothed:<5.0f} | RED: {current_red_smoothed:<5.0f} | BPM: --- | SpO2: Așteaptă degetul...")
                         last_print_time = utime.ticks_ms()
 
-            utime.sleep_ms(POLL_INTERVAL_MS) # Așteaptă înainte de următoarea citire
+            utime.sleep_ms(POLL_INTERVAL_MS)
 
         except OSError as e:
-            # Eroare I2C - Poate fi o deconectare temporară sau problemă hardware
+            # ... (OSError handling as before, ensure bpm_calc.reset() is also called) ...
             print(f"Eroare I2C: {e}. Se reîncearcă...")
             utime.sleep_ms(1000)
             try:
-                # Încearcă să resetezi și să reconfigurezi senzorul complet
-                sensor.reset()
-                utime.sleep_ms(100)
+                sensor.reset(); utime.sleep_ms(100)
                 sensor.set_mode(MODE_SPO2)
-                sensor.configure_spo2_and_adc(
-                    sample_rate=SAMPLE_RATE_SPS,
-                    pulse_width=1600, 
-                    adc_range=4096
-                )
-                sensor.set_led_currents(led_current_red=11.0, led_current_ir=11.0)
-                sensor.clear_fifo() # Golește FIFO după resetare
+                sensor.configure_spo2_and_adc(sample_rate=SAMPLE_RATE_SPS, pulse_width=1600, adc_range=4096)
+                sensor.set_led_currents(led_current_red=led_current_setting_red, led_current_ir=led_current_setting_ir)
+                sensor.clear_fifo()
+                spo2_calc.reset()
+                bpm_calc.reset() # <<< NEW
+                raw_ir_smoothing_buffer.clear(); raw_red_smoothing_buffer.clear()
+                finger_on = False
                 print("Senzor resetat și reconfigurat după eroare I2C.")
             except Exception as reinit_e:
                 print(f"Eroare la resetarea senzorului după eroare I2C: {reinit_e}")
-                # În caz de eroare persistentă, poate fi necesară o repornire completă
-                utime.sleep_ms(5000) # Așteaptă mai mult înainte de a reîncerca
-
+                utime.sleep_ms(5000)
         except Exception as e:
-            # Orice altă eroare neașteptată
+            # ... (general exception handling as before) ...
             import sys
             sys.print_exception(e)
             print(f"Eroare în bucla principală.")
             utime.sleep_ms(1000)
+
 
 if __name__ == "__main__":
     main()
