@@ -1,0 +1,101 @@
+body {
+  background: linear-gradient(-30deg, #b87c92, #711b29, #a95e79, #57090b);
+  background-size: 400% 400%;
+  animation: gradientAnimation 10s ease infinite;
+  font-family: 'Copperplate', 'Copperplate Gothic Light', sans-serif;
+  color: black;
+  padding: 20px;
+  margin: 0;
+  height: 100vh;
+}
+h1 {
+    font-family: 'Copperplate', 'Copperplate Gothic Light', sans-serif;
+    position: relative;
+    color: black;
+    display: flex;
+    justify-content:center;
+    padding: 0.5rem 1rem;
+    font-size: 4rem;
+    text-shadow: 2px 2px 4px #17040b;
+}
+h2 {
+    font-family: 'Copperplate', 'Copperplate Gothic Light', sans-serif;
+    position: relative;
+    color: black;
+    display: flex;
+    justify-content:center;
+    padding: 0.5rem 1rem;
+    font-size: 3rem;
+    text-shadow: 2px 2px 4px #17040b;
+}
+h3 {
+    font-family: 'Copperplate', 'Copperplate Gothic Light', sans-serif;
+    position: relative;
+    color: black;
+    display: flex;
+    justify-content:center;
+    padding: 0.5rem 1rem;
+    font-size: 1.5rem;
+    text-shadow: 2px 2px 4px #17040b;
+}
+button, input[type="submit"] {
+  background-color: #511028;  
+  color: black;
+  border: none;
+  padding: 0.75rem 2rem;
+  font-size: 2.5rem;
+  font-family: 'Copperplate', 'Copperplate Gothic Light', sans-serif;
+  cursor: pointer;
+  width:30%;
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+  transition: background-color 0.3s ease, transform 0.2s ease;
+  display: block;
+  margin: 2rem auto;         
+  text-shadow: 1px 1px 2px #904b66;
+}
+button:hover, input[type="submit"]:hover {
+  background-color: #7d0632;     
+  transform: scale(1.05);
+  color:white;
+}
+@keyframes gradientAnimation {
+  0% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
+  }
+  100% {
+    background-position: 0% 50%;
+  }
+}
+div {
+  display: flex;
+  justify-content: center;
+  gap: 2rem;
+  margin: 2rem auto;
+}
+.ps {
+  border: 3px solid #57090b;
+  padding: 1rem;
+  margin: 1rem auto;
+  width: 250px;
+  height: 150px;
+  background-color: rgba(205, 67, 115, 0.2);
+  color: white;
+  border-radius: 10px;
+  box-shadow: 0 0 10px rgba(0,0,0,0.2);
+  
+  display: flex;
+  align-items: center;      
+  justify-content: center; 
+  text-align: center;
+}
+
+.ps p {
+  font-family: 'Copperplate', 'Copperplate Gothic Light', sans-serif;
+  font-size: 3rem;
+  margin: 0;
+  color: black;
+  text-shadow: 2px 2px 4px #17040b;
+}

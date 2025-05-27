@@ -1,112 +1,181 @@
-# main.py
 import machine
 import utime
 import math
-import max30100 # Ensure max30100.py is in the same directory
+import json
+import max30100
 
-# --- Board Specific Configuration ---
-I2C_BUS_ID = 0
-SCL_PIN = 5 # GPIO5
-SDA_PIN = 4 # GPIO4
-# --------------------------------------------------------------------
+measurement_active_in_pulse_py = False 
 
-# --- SpO2 Parameters ---
-# Tune these based on observed DC levels when finger is on vs. off
-FINGER_MIN_IR_VALUE = 5000  # Example: Adjust based on your readings with good LED currents
-FINGER_MIN_RED_VALUE = 5000 # Example: Adjust based on your readings
+I2C_BUS_ID_PULSE = 0
+SCL_PIN_PULSE = 5
+SDA_PIN_PULSE = 4
+FINGER_MIN_IR_VALUE_PULSE = 5000
+FINGER_MIN_RED_VALUE_PULSE = 5000
+SPO2_CALCULATION_WINDOW_SIZE_PULSE = 100
+MIN_SAMPLES_FOR_SPO2_PULSE = 30
+POLL_INTERVAL_MS_PULSE = 50
+SAMPLE_RATE_SPS_PULSE = 100
+SMOOTHING_WINDOW_SIZE_PULSE = 10
+MODE_SPO2_PULSE = max30100.MODE_SPO2_EN
 
-SPO2_CALCULATION_WINDOW_SIZE = 500
-MIN_SAMPLES_FOR_SPO2 = 100
+LED_CURRENT_RED_PULSE = 14.2
+LED_CURRENT_IR_PULSE = 40.2
+MIN_AC_AMP_SPO2_PULSE = 20.0
 
-POLL_INTERVAL_MS = 20
-SAMPLE_RATE_SPS = 100
+DATA_FILE_PATH = "/sensordata.json"
+FILE_WRITE_INTERVAL_S = 1
 
-SMOOTHING_WINDOW_SIZE = 50
-raw_ir_smoothing_buffer = []
-raw_red_smoothing_buffer = []
-# -------------------------------------
+def median(lst):
+    n = len(lst)
+    s = sorted(lst)
+    if n == 0:
+        return 0
+    if n % 2 == 1:
+        return s[n // 2]
+    else:
+        return (s[n // 2 - 1] + s[n // 2]) / 2
 
-MODE_SPO2 = max30100.MODE_SPO2_EN
+class BPMCalculator:
+    def __init__(self, sample_rate_sps=SAMPLE_RATE_SPS_PULSE, window_seconds=8, bpm_avg_size=6):
+        self.sample_rate = sample_rate_sps
+        self.ir_data_buffer = []
+        self.buffer_max_size = int(sample_rate_sps * window_seconds)
+        self.last_peak_time_ms = 0
+        self.beat_intervals_ms = []
+        self.bpm_avg_size = bpm_avg_size
+        self.current_bpm = 0.0
+        self.min_samples_between_peaks = int(sample_rate_sps * 0.3)
+        self.samples_since_last_peak = 0
+        self.last_peak_detected_time_ms = utime.ticks_ms()
+        self.peak_timeout_ms = 4000
 
+    def add_ir_reading(self, ir_sample):
+        if self.ir_data_buffer:
+            prev = self.ir_data_buffer[-1]
+            if abs(ir_sample - prev) > 0.2 * prev:
+                return
+        self.ir_data_buffer.append(ir_sample)
+        if len(self.ir_data_buffer) > self.buffer_max_size:
+            self.ir_data_buffer.pop(0)
+        self.samples_since_last_peak += 1
+        if len(self.ir_data_buffer) < 5:
+            return
+
+        idx = -3
+        prev2 = self.ir_data_buffer[idx]
+        prev1 = self.ir_data_buffer[idx+1]
+        curr = self.ir_data_buffer[idx+2]
+        next1 = self.ir_data_buffer[idx+3]
+        next2 = self.ir_data_buffer[idx+4]
+
+        window = self.ir_data_buffer[-self.buffer_max_size:] if len(self.ir_data_buffer) >= self.buffer_max_size else self.ir_data_buffer
+        min_ir = min(window)
+        max_ir = max(window)
+        median_ir = median(window)
+        threshold = median_ir + 0.4 * (max_ir - median_ir)
+
+        is_peak = (
+            prev1 < curr > next1 and
+            curr > threshold and
+            self.samples_since_last_peak >= self.min_samples_between_peaks
+        )
+
+        if is_peak:
+            current_time_ms = utime.ticks_ms()
+            self.last_peak_detected_time_ms = current_time_ms
+            if self.last_peak_time_ms > 0:
+                interval_ms = utime.ticks_diff(current_time_ms, self.last_peak_time_ms)
+                if 300 < interval_ms < 2000:
+                    self.beat_intervals_ms.append(interval_ms)
+                    if len(self.beat_intervals_ms) > self.bpm_avg_size:
+                        self.beat_intervals_ms.pop(0)
+                    if len(self.beat_intervals_ms) > 0:
+                        avg_interval_ms = sum(self.beat_intervals_ms) / len(self.beat_intervals_ms)
+                        self.current_bpm = 60000.0 / avg_interval_ms
+                        print(f"pulse.py: BPM peak detected, interval={interval_ms} ms, BPM={self.current_bpm:.1f}")
+            self.last_peak_time_ms = current_time_ms
+            self.samples_since_last_peak = 0
+
+    def get_bpm(self):
+        if utime.ticks_diff(utime.ticks_ms(), self.last_peak_detected_time_ms) > self.peak_timeout_ms:
+            self.current_bpm = 0.0
+            self.beat_intervals_ms.clear()
+        if 30 < self.current_bpm < 220:
+            return self.current_bpm
+        return 0.0
+
+    def reset(self):
+        self.ir_data_buffer.clear()
+        self.last_peak_time_ms = 0
+        self.beat_intervals_ms.clear()
+        self.current_bpm = 0.0
+        self.samples_since_last_peak = 0
 
 class SpO2Calculator:
-    def __init__(self, buffer_size=SPO2_CALCULATION_WINDOW_SIZE):
+    def __init__(self, buffer_size=SPO2_CALCULATION_WINDOW_SIZE_PULSE):
         self.buffer_size = buffer_size
         self.red_buffer = []
         self.ir_buffer = []
         self.spo2_value = 0.0
-        
         self.last_dc_red = 0
         self.last_dc_ir = 0
         self.last_ac_red_rms = 0
         self.last_ac_ir_rms = 0
         self.last_r_value = 0.0
-        # self.finger_present = False # Not used in this class directly
 
     def add_reading(self, red_sample, ir_sample):
+        if self.red_buffer and abs(red_sample - self.red_buffer[-1]) > 0.2 * self.red_buffer[-1]:
+            return
+        if self.ir_buffer and abs(ir_sample - self.ir_buffer[-1]) > 0.2 * self.ir_buffer[-1]:
+            return
         self.red_buffer.append(red_sample)
         self.ir_buffer.append(ir_sample)
-
         while len(self.red_buffer) > self.buffer_size:
             self.red_buffer.pop(0)
         while len(self.ir_buffer) > self.buffer_size:
             self.ir_buffer.pop(0)
 
     def calculate_spo2(self):
-        if len(self.red_buffer) < MIN_SAMPLES_FOR_SPO2:
-            return 0.0
-
-        dc_red = sum(self.red_buffer) / len(self.red_buffer)
-        dc_ir = sum(self.ir_buffer) / len(self.ir_buffer)
-        
+        if len(self.red_buffer) < MIN_SAMPLES_FOR_SPO2_PULSE:
+            return self.spo2_value
+        red_buf = list(self.red_buffer)
+        ir_buf = list(self.ir_buffer)
+        if len(red_buf) > 5:
+            red_buf = sorted(red_buf)[1:-1]
+        if len(ir_buf) > 5:
+            ir_buf = sorted(ir_buf)[1:-1]
+        dc_red = sum(red_buf) / len(red_buf)
+        dc_ir = sum(ir_buf) / len(ir_buf)
         self.last_dc_red = dc_red
         self.last_dc_ir = dc_ir
-
-        # Optional: Secondary DC check, though main loop finger detection is primary
-        # Consider adjusting or removing if FINGER_MIN_RED_VALUE is well-tuned in main
-        # if dc_red < FINGER_MIN_RED_VALUE / 2 or dc_ir < FINGER_MIN_IR_VALUE / 2 :
-        #     return 0.0 # Semnal prea slab
-
-        ac_red_sq_sum = sum([(val - dc_red) ** 2 for val in self.red_buffer])
-        ac_red_rms = math.sqrt(ac_red_sq_sum / len(self.red_buffer))
-
-        ac_ir_sq_sum = sum([(val - dc_ir) ** 2 for val in self.ir_buffer])
-        ac_ir_rms = math.sqrt(ac_ir_sq_sum / len(self.ir_buffer))
-        
+        if dc_red == 0 or dc_ir == 0:
+            return self.spo2_value
+        ac_red_sq_sum = sum([(v - dc_red) ** 2 for v in red_buf])
+        ac_red_rms = math.sqrt(ac_red_sq_sum / len(red_buf))
+        ac_ir_sq_sum = sum([(v - dc_ir) ** 2 for v in ir_buf])
+        ac_ir_rms = math.sqrt(ac_ir_sq_sum / len(ir_buf))
         self.last_ac_red_rms = ac_red_rms
         self.last_ac_ir_rms = ac_ir_rms
-
-        MIN_AC_AMPLITUDE = 30.0 # Or 40.0, based on your observations of AC for good readings
-        if ac_red_rms < MIN_AC_AMPLITUDE or ac_ir_rms < MIN_AC_AMPLITUDE:
-            # print(f"AC too weak: ACR={ac_red_rms:.1f}, ACI={ac_ir_rms:.1f}")
-            return self.spo2_value # Return last valid value
-
-        if dc_red == 0 or dc_ir == 0:
-             return self.spo2_value
+        if ac_red_rms < MIN_AC_AMP_SPO2_PULSE or ac_ir_rms < MIN_AC_AMP_SPO2_PULSE:
+            return self.spo2_value
         ratio_red = ac_red_rms / dc_red
         ratio_ir = ac_ir_rms / dc_ir
-
         if ratio_ir == 0:
             return self.spo2_value
-
         R = ratio_red / ratio_ir
+        if R < 0.3: R = 0.3
+        if R > 1.2: R = 1.2
         self.last_r_value = R
-
         a = -45.060
         b = 30.354
         c = 94.845
         spo2_calc = a * R * R + b * R + c
-
-        if spo2_calc > 100.0:
-            spo2_calc = 100.0
-        elif spo2_calc < 70.0: # This floor is still useful
-            spo2_calc = 70.0
-
+        if spo2_calc > 100.0: spo2_calc = 100.0
+        elif spo2_calc < 70.0: spo2_calc = 70.0
         self.spo2_value = spo2_calc
         return self.spo2_value
 
     def reset(self):
-        # print("Resetting SpO2 calculator...") # Optional
         self.red_buffer.clear()
         self.ir_buffer.clear()
         self.spo2_value = 0.0
@@ -115,238 +184,140 @@ class SpO2Calculator:
         self.last_dc_ir = 0
         self.last_ac_red_rms = 0
         self.last_ac_ir_rms = 0
-        # self.finger_present = False # Not used
-        
-        
-# Add this class definition alongside your SpO2Calculator class
 
-class BPMCalculator:
-    def __init__(self, sample_rate_sps=100, window_seconds=6, bpm_avg_size=4): # window_seconds to look for peaks
-        self.sample_rate = sample_rate_sps
-        self.ir_data_buffer = [] # Buffer to store IR data for peak detection
-        self.buffer_max_size = int(sample_rate_sps * window_seconds) # e.g., 100sps * 6s = 600 samples
-        
-        self.last_peak_time_ms = 0
-        self.beat_intervals_ms = [] # Store recent beat-to-beat intervals in ms
-        self.bpm_avg_size = bpm_avg_size # Number of recent beats to average for BPM
-        
-        self.current_bpm = 0.0
-        
-        # Peak detection parameters (these may need tuning)
-        # self.peak_threshold_factor = 0.6 # Not used in this simplified version yet
-        self.min_samples_between_peaks = int(sample_rate_sps * 0.3) # e.g., 300ms physiological limit (200 BPM max)
-        self.samples_since_last_peak = 0
-        self.last_ir_value_for_slope = 0 # To detect rising/falling slope for simple peak detection (not fully used in current simple peak)
+class PulseOximeter:
+    def __init__(self):
+        print("PulseOximeter: __init__ called")
+        self.initialized = False
+        self.sensor_status = "Initializing..."
+        self.is_finger = False
+        self.current_spo2 = 0.0
+        self.current_bpm_val = 0.0
+        self.signal_quality = 0.0
+        self.last_file_write_time_ms = utime.ticks_ms()
+        self._init_sensor()
 
-    def add_ir_reading(self, ir_sample):
-        self.ir_data_buffer.append(ir_sample) # <<< FIXED >>>
-        if len(self.ir_data_buffer) > self.buffer_max_size: # <<< FIXED (both self.)>>>
-            self.ir_data_buffer.pop(0) # <<< FIXED >>>
-
-        self.samples_since_last_peak += 1 # <<< FIXED >>>
-
-        if len(self.ir_data_buffer) < 3: # <<< FIXED >>>
-            self.last_ir_value_for_slope = ir_sample # <<< FIXED >>>
-            return
-
-        is_potential_peak = False
-        if len(self.ir_data_buffer) >= 3 and \
-           self.ir_data_buffer[-3] < self.ir_data_buffer[-2] and \
-           self.ir_data_buffer[-2] > self.ir_data_buffer[-1]: # <<< FIXED (all self.ir_data_buffer) >>>
-            
-            if self.samples_since_last_peak >= self.min_samples_between_peaks: # <<< FIXED (both self.) >>>
-                is_potential_peak = True
-
-        if is_potential_peak:
-            current_time_ms = utime.ticks_ms()
-            if self.last_peak_time_ms > 0: # <<< FIXED >>>
-                interval_ms = utime.ticks_diff(current_time_ms, self.last_peak_time_ms) # <<< FIXED >>>
-                
-                if 300 < interval_ms < 2000: # Physiological filter
-                    self.beat_intervals_ms.append(interval_ms) # <<< FIXED >>>
-                    if len(self.beat_intervals_ms) > self.bpm_avg_size: # <<< FIXED (both self.) >>>
-                        self.beat_intervals_ms.pop(0) # <<< FIXED >>>
-                    
-                    if len(self.beat_intervals_ms) > 0: # <<< FIXED >>>
-                        avg_interval_ms = sum(self.beat_intervals_ms) / len(self.beat_intervals_ms) # <<< FIXED >>>
-                        self.current_bpm = 60000.0 / avg_interval_ms # <<< FIXED >>>
-                    else:
-                        self.current_bpm = 0.0 # <<< FIXED >>>
-            
-            self.last_peak_time_ms = current_time_ms # <<< FIXED >>>
-            self.samples_since_last_peak = 0 # <<< FIXED >>>
-        
-        self.last_ir_value_for_slope = ir_sample # <<< FIXED >>>
-
-
-    def get_bpm(self):
-        if 30 < self.current_bpm < 220: # <<< FIXED >>>
-            return self.current_bpm # <<< FIXED >>>
-        return 0.0
-
-    def reset(self):
-        # print("Resetting BPM calculator...") # Optional
-        self.ir_data_buffer.clear() # <<< FIXED >>>
-        self.last_peak_time_ms = 0 # <<< FIXED >>>
-        self.beat_intervals_ms.clear() # <<< FIXED >>>
-        self.current_bpm = 0.0 # <<< FIXED >>>
-        self.samples_since_last_peak = 0 # <<< FIXED >>>
-        self.last_ir_value_for_slope = 0 # <<< FIXED >>>
-        
-        
-
-def main():
-    print("Inițializare senzor MAX30100 pentru SpO2 & BPM...")
-
-    led_current_setting_red = 14.2
-    led_current_setting_ir = 40.2
-
-    try:
-        i2c = machine.I2C(I2C_BUS_ID, scl=machine.Pin(SCL_PIN), sda=machine.Pin(SDA_PIN), freq=400000)
-        devices = i2c.scan()
-        # ... (rest of sensor initialization as before) ...
-        sensor = max30100.MAX30100(
-            i2c=i2c,
-            mode=MODE_SPO2, # SpO2 mode also provides IR data needed for BPM
-            sample_rate=SAMPLE_RATE_SPS,
-            led_current_red = led_current_setting_red,
-            led_current_ir = led_current_setting_ir,
-            pulse_width=1600,
-            adc_range=4096,
-            max_buffer_len=SPO2_CALCULATION_WINDOW_SIZE + SMOOTHING_WINDOW_SIZE + 10
-        )
-        print(f"Senzor MAX30100 (Part ID: {hex(sensor.get_part_id())}) inițializat. Așezați degetul ferm și acoperiți senzorul.")
-
-    except Exception as e:
-        # ... (exception handling as before) ...
-        return
-
-    spo2_calc = SpO2Calculator()
-    bpm_calc = BPMCalculator(sample_rate_sps=SAMPLE_RATE_SPS) # <<< NEW: Instantiate BPM calculator
-
-    last_print_time = utime.ticks_ms()
-    finger_on = False
-    print_interval_ms = 1000
-
-    while True:
+    def _init_sensor(self):
+        print("PulseOximeter: _init_sensor called")
         try:
-            sensor.read_sensor_fifo()
-            latest_ir_raw = sensor.ir
-            latest_red_raw = sensor.red
-
-            current_ir_smoothed = latest_ir_raw if latest_ir_raw is not None else 0
-            current_red_smoothed = latest_red_raw if latest_red_raw is not None else 0
-
-            if latest_ir_raw is not None and latest_red_raw is not None:
-                # Smoothing (as before)
-                raw_ir_smoothing_buffer.append(latest_ir_raw)
-                raw_red_smoothing_buffer.append(latest_red_raw)
-
-                if len(raw_ir_smoothing_buffer) > SMOOTHING_WINDOW_SIZE:
-                    raw_ir_smoothing_buffer.pop(0)
-                if len(raw_red_smoothing_buffer) > SMOOTHING_WINDOW_SIZE:
-                    raw_red_smoothing_buffer.pop(0)
-                
-                if len(raw_ir_smoothing_buffer) == SMOOTHING_WINDOW_SIZE:
-                    current_ir_smoothed = sum(raw_ir_smoothing_buffer) / SMOOTHING_WINDOW_SIZE
-                    current_red_smoothed = sum(raw_red_smoothing_buffer) / SMOOTHING_WINDOW_SIZE
-                
-                # Finger detection (as before)
-                if current_ir_smoothed > FINGER_MIN_IR_VALUE and \
-                   current_red_smoothed > FINGER_MIN_RED_VALUE:
-                    if not finger_on:
-                        print("Deget detectat. Se stabilizează citirile...")
-                        finger_on = True
-                        spo2_calc.reset()
-                        bpm_calc.reset() # <<< NEW: Reset BPM calculator
-                        raw_ir_smoothing_buffer.clear()
-                        raw_red_smoothing_buffer.clear()
-                    
-                    # Add readings to calculators
-                    spo2_calc.add_reading(current_red_smoothed, current_ir_smoothed)
-                    bpm_calc.add_ir_reading(current_ir_smoothed) # <<< NEW: Add IR to BPM calculator
-                    
-                    calculated_spo2_this_cycle = 0.0
-                    current_bpm_value = 0.0 # <<< NEW
-                    
-                    if len(spo2_calc.red_buffer) >= MIN_SAMPLES_FOR_SPO2:
-                        calculated_spo2_this_cycle = spo2_calc.calculate_spo2()
-                    
-                    current_bpm_value = bpm_calc.get_bpm() # <<< NEW: Get BPM
-
-                    # Conditional Printing (as before, now add BPM)
-                    if utime.ticks_diff(utime.ticks_ms(), last_print_time) >= print_interval_ms:
-                        spo2_display_str = f"{calculated_spo2_this_cycle:.1f}%" if calculated_spo2_this_cycle > 0 else "Calc..."
-                        if calculated_spo2_this_cycle < 90.0 and calculated_spo2_this_cycle > 0 : # If SpO2 is calculated but low
-                            spo2_display_str = f"{calculated_spo2_this_cycle:.1f}% (R:{spo2_calc.last_r_value:.3f})"
-                        elif not (calculated_spo2_this_cycle >= 90.0 and (0.3 < spo2_calc.last_r_value < 0.9)):
-                            # If not printing full SpO2, at least show BPM if available
-                            if current_bpm_value > 0:
-                                print(f"Status: BPM: {current_bpm_value:.1f} | IR:{current_ir_smoothed:<5.0f} RED:{current_red_smoothed:<5.0f} SpO2:{spo2_display_str}")
-                            else:
-                                print(f"Status: Collecting... | IR:{current_ir_smoothed:<5.0f} RED:{current_red_smoothed:<5.0f} SpO2:{spo2_display_str}")
-                            last_print_time = utime.ticks_ms()
-                            # Continue to next iteration of the loop if we printed a status message
-                            # and don't meet the >90% SpO2 condition, to avoid printing the full line.
-                            # However, the original request was to *only* print full if SpO2 > 90.
-                            # Let's stick to that.
-
-                        # Print full line if SpO2 is good, or just status if BPM is the only thing ready.
-                        if calculated_spo2_this_cycle >= 90.0 and (0.3 < spo2_calc.last_r_value < 0.9):
-                            print(f"IR: {current_ir_smoothed:<5.0f} | RED: {current_red_smoothed:<5.0f} | "
-                                  f"BPM: {current_bpm_value:.1f} | SpO2: {calculated_spo2_this_cycle:.1f}% | R: {spo2_calc.last_r_value:.3f} "
-                                  f"(ACr:{spo2_calc.last_ac_red_rms:.1f}, DCr:{spo2_calc.last_dc_red:.0f}, "
-                                  f"ACir:{spo2_calc.last_ac_ir_rms:.1f}, DCir:{spo2_calc.last_dc_ir:.0f})")
-                        elif current_bpm_value > 0: # SpO2 not >90 or R bad, but BPM is available
-                             print(f"Status: BPM: {current_bpm_value:.1f} | IR:{current_ir_smoothed:<5.0f} RED:{current_red_smoothed:<5.0f} SpO2:{spo2_display_str}")
-                        # else: # Neither good SpO2 nor BPM ready, but finger is on.
-                        #     print(f"Status: Processing... | IR:{current_ir_smoothed:<5.0f} RED:{current_red_smoothed:<5.0f}")
-
-                        last_print_time = utime.ticks_ms()
-                
-                elif finger_on: # Finger removed
-                    print("Deget îndepărtat sau semnal slab.")
-                    finger_on = False
-                    spo2_calc.reset()
-                    bpm_calc.reset() # <<< NEW: Reset BPM calculator
-                    raw_ir_smoothing_buffer.clear()
-                    raw_red_smoothing_buffer.clear()
-                    if utime.ticks_diff(utime.ticks_ms(), last_print_time) >= print_interval_ms:
-                        print(f"IR: {current_ir_smoothed:<5.0f} | RED: {current_red_smoothed:<5.0f} | BPM: --- | SpO2: ---")
-                        last_print_time = utime.ticks_ms()
-                
-                else: # Finger not on
-                    if utime.ticks_diff(utime.ticks_ms(), last_print_time) >= print_interval_ms:
-                        print(f"IR: {current_ir_smoothed:<5.0f} | RED: {current_red_smoothed:<5.0f} | BPM: --- | SpO2: Așteaptă degetul...")
-                        last_print_time = utime.ticks_ms()
-
-            utime.sleep_ms(POLL_INTERVAL_MS)
-
-        except OSError as e:
-            # ... (OSError handling as before, ensure bpm_calc.reset() is also called) ...
-            print(f"Eroare I2C: {e}. Se reîncearcă...")
-            utime.sleep_ms(1000)
-            try:
-                sensor.reset(); utime.sleep_ms(100)
-                sensor.set_mode(MODE_SPO2)
-                sensor.configure_spo2_and_adc(sample_rate=SAMPLE_RATE_SPS, pulse_width=1600, adc_range=4096)
-                sensor.set_led_currents(led_current_red=led_current_setting_red, led_current_ir=led_current_setting_ir)
-                sensor.clear_fifo()
-                spo2_calc.reset()
-                bpm_calc.reset() # <<< NEW
-                raw_ir_smoothing_buffer.clear(); raw_red_smoothing_buffer.clear()
-                finger_on = False
-                print("Senzor resetat și reconfigurat după eroare I2C.")
-            except Exception as reinit_e:
-                print(f"Eroare la resetarea senzorului după eroare I2C: {reinit_e}")
-                utime.sleep_ms(5000)
+            self.i2c = machine.I2C(I2C_BUS_ID_PULSE, scl=machine.Pin(SCL_PIN_PULSE), sda=machine.Pin(SDA_PIN_PULSE), freq=400000)
+            self.sensor = max30100.MAX30100(
+                i2c=self.i2c, mode=MODE_SPO2_PULSE, sample_rate=SAMPLE_RATE_SPS_PULSE,
+                led_current_red=LED_CURRENT_RED_PULSE, led_current_ir=LED_CURRENT_IR_PULSE,
+                pulse_width=1600, adc_range=4096,
+                max_buffer_len=SPO2_CALCULATION_WINDOW_SIZE_PULSE + SMOOTHING_WINDOW_SIZE_PULSE + 20
+            )
+            self.spo2_calc = SpO2Calculator()
+            self.bpm_calc = BPMCalculator()
+            self.raw_ir_smoothing_buffer = []
+            self.raw_red_smoothing_buffer = []
+            self.initialized = True
+            self.sensor_status = "Sensor OK. Place finger."
+            print("Sensor initialized OK", self.sensor_status)
+            print("I2C scan from pulse:", self.i2c.scan())
         except Exception as e:
-            # ... (general exception handling as before) ...
-            import sys
-            sys.print_exception(e)
-            print(f"Eroare în bucla principală.")
-            utime.sleep_ms(1000)
+            self.sensor_status = "Sensor Init ERROR"
+            print("pulse.py: Sensor init error:", e)
+            self.initialized = False
 
+    def step(self, active):
+        print(f"PulseOximeter: step called, active={active}, initialized={self.initialized}")
+        if not self.initialized:
+            self._init_sensor()
+            return 0, 0, False
+
+        if not active:
+            self.sensor_status = "Stopped. Click Start."
+            self.is_finger = False
+            self.current_spo2 = 0.0
+            self.current_bpm_val = 0.0
+            return 0, 0, False
+
+        try:
+            self.sensor.read_sensor_fifo()
+            print(f"PulseOximeter: sensor read completed, ir={self.sensor.ir}, red={self.sensor.red}")
+            latest_ir = self.sensor.ir
+            latest_red = self.sensor.red
+            print(f"latest_ir={latest_ir}, latest_red={latest_red}")
+
+            if latest_ir is not None and latest_red is not None:
+                self.raw_ir_smoothing_buffer.append(latest_ir)
+                self.raw_red_smoothing_buffer.append(latest_red)
+                if len(self.raw_ir_smoothing_buffer) > SMOOTHING_WINDOW_SIZE_PULSE:
+                    self.raw_ir_smoothing_buffer.pop(0)
+                if len(self.raw_red_smoothing_buffer) > SMOOTHING_WINDOW_SIZE_PULSE:
+                    self.raw_red_smoothing_buffer.pop(0)
+
+                if len(self.raw_ir_smoothing_buffer) == SMOOTHING_WINDOW_SIZE_PULSE:
+                    current_ir_smoothed = sum(self.raw_ir_smoothing_buffer) / SMOOTHING_WINDOW_SIZE_PULSE
+                    current_red_smoothed = sum(self.raw_red_smoothing_buffer) / SMOOTHING_WINDOW_SIZE_PULSE
+                else:
+                    current_ir_smoothed = latest_ir
+                    current_red_smoothed = latest_red
+
+                print(f"latest_ir={latest_ir}, latest_red={latest_red}")
+                print(f"current_ir_smoothed={current_ir_smoothed}, current_red_smoothed={current_red_smoothed}")
+                
+                print("is_finger:", self.is_finger)
+                
+                was_finger = self.is_finger
+
+                if current_ir_smoothed > FINGER_MIN_IR_VALUE_PULSE and current_red_smoothed > FINGER_MIN_RED_VALUE_PULSE:
+                    print("Finger detected with sufficient signal quality.")
+                    if not was_finger:
+                        self.sensor_status = "Finger detected. Stabilizing..."
+                        print("Transition: no finger -> finger detected. Resetting buffers.")
+                        self.spo2_calc.reset()
+                        self.bpm_calc.reset()
+                        self.raw_ir_smoothing_buffer.clear()
+                        self.raw_red_smoothing_buffer.clear()
+                    self.is_finger = True
+
+                    self.spo2_calc.add_reading(current_red_smoothed, current_ir_smoothed)
+                    self.bpm_calc.add_ir_reading(current_ir_smoothed)
+
+                    if len(self.spo2_calc.red_buffer) >= MIN_SAMPLES_FOR_SPO2_PULSE:
+                        calc_spo2 = self.spo2_calc.calculate_spo2()
+                        if 70.0 <= calc_spo2 <= 100.0 and (0.3 < self.spo2_calc.last_r_value < 1.2):
+                            self.current_spo2 = calc_spo2
+                        elif calc_spo2 <= 70.0:
+                            self.spo2_calc.reset()
+                            self.current_spo2 = 0.0
+
+                    calc_bpm = self.bpm_calc.get_bpm()
+                    if calc_bpm > 0:
+                        self.current_bpm_val = calc_bpm
+                elif self.is_finger:
+                    print("Finger removed or signal lost.")
+                    self.sensor_status = "Finger removed or signal lost."
+                    self.is_finger = False
+                    self.spo2_calc.reset()
+                    self.bpm_calc.reset()
+                    self.raw_ir_smoothing_buffer.clear()
+                    self.raw_red_smoothing_buffer.clear()
+                    self.current_spo2 = 0.0
+                    self.current_bpm_val = 0.0
+                else:
+                    print("No finger detected or signal too weak.")
+                    self.sensor_status = "Place finger on sensor."
+                    self.current_spo2 = 0.0
+                    self.current_bpm_val = 0.0
+            print(f"PulseOximeter: returning bpm={self.current_bpm_val}, spo2={self.current_spo2}, finger_on={self.is_finger}")
+            return int(self.current_bpm_val), int(self.current_spo2), self.is_finger
+
+        except Exception as e:
+            print("pulse.py: Sensor step error:", e)
+            return 0, 0, False
 
 if __name__ == "__main__":
-    main()
+    import time
+    print("Running pulse.py as main for testing...")
+    ox = PulseOximeter()
+    ox_active = True
+    try:
+        while True:
+            bpm, spo2, finger_on = ox.step(ox_active)
+            print(f"[TEST LOOP] BPM={bpm}, SpO2={spo2}, Finger on={finger_on}")
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        print("Test loop stopped by user.")
