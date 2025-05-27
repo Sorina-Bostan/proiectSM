@@ -7,9 +7,31 @@ import ujson
 import random
 import errno
 import utime
+import pulse
+import machine
+
+BUZZER_PIN = 22
+LED_PIN = 26
+last_beep_time = 0
+alarm_on = False
+alarm_on_time = 0
+
+buzzer = machine.PWM(machine.Pin(BUZZER_PIN))
+led = machine.Pin(LED_PIN, machine.Pin.OUT)
+
+PULS_MIN = 60
+PULS_MAX = 100
+
+def alarma_on():
+    buzzer.freq(420)
+    buzzer.duty_u16(30000)
+
+def alarma_off():
+    buzzer.duty_u16(0)
+
+alarma_off()
 
 MAX_CLIENTS = 10
-
 
 stop_flag = False
 stop_lock = _thread.allocate_lock()
@@ -86,9 +108,9 @@ def process_http_request(sock, req_str, sensor_state, probe_paths, redir):
             path = parts[1]
             # captive portal probe paths
             if path in probe_paths:
-                if path == "/generate_204":  # Android check
-                    sock.sendall(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
-                else:
+                # if path == "/generate_204":  # Android check
+                #     sock.sendall(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                # else:
                     sock.sendall(redir.encode())
             elif path == '/start':
                 sensor_state["active"] = True
@@ -100,6 +122,7 @@ def process_http_request(sock, req_str, sensor_state, probe_paths, redir):
                 sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n" + response.encode())
             elif path == '/data':
                 response = ujson.dumps(sensor_state)
+                print("Sending sensor data:", response)
                 sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n" + response.encode())
             else:  # Serve static files
                 if path == '/':
@@ -244,48 +267,74 @@ def run_web_server(wlan_ap):
         print("Access point stopped")
         print("thread_task stopping!")
 
-def read_pulseoximeter():
-    # placeholder function to simulate reading from a pulse oximeter
-    # todo: replace with real (functional) code
-    bpm = random.randint(60, 100)
-    spo2 = random.randint(95, 100)
-    finger_on = random.choice([True, True, True, True,
-                               True, True, True, False]) # type: ignore because issues with Subscriptable
-    time.sleep(0.5) # simulate sensor delay
-    print(f"Read pulse oximeter: BPM={bpm}, SpO2={spo2}, Finger on={finger_on}")
-    return bpm, spo2, finger_on
+# def read_pulseoximeter():
+#     # placeholder function to simulate reading from a pulse oximeter
+#     bpm = random.randint(60, 100)
+#     spo2 = random.randint(95, 100)
+#     finger_on = random.choice([True, True, True, True,
+#                                True, True, True, False]) # type: ignore because issues with Subscriptable
+#     time.sleep(0.5) # simulate sensor delay
+#     print(f"Read pulse oximeter: BPM={bpm}, SpO2={spo2}, Finger on={finger_on}")
+#     return bpm, spo2, finger_on
 
 def main_core():
-    global stop_flag
+    global stop_flag, sensor_state, last_beep_time, alarm_on, alarm_on_time
+    time.sleep(2)
+    pulse_oximeter = pulse.PulseOximeter()
+    print("I2C scan from main:", pulse_oximeter.i2c.scan())
+    sensor_state["active"] = True # lasa-l sa se incalzeasca
     while True:
         with stop_lock:
             if stop_flag:
                 break
         if sensor_state["active"]:
-            bpm, spo2, finger_on = read_pulseoximeter()
+            bpm, spo2, finger_on = pulse_oximeter.step(sensor_state["active"])
+            bpm -= 20 if bpm > 100 else 0
             sensor_state["bpm"] = bpm
             sensor_state["spo2"] = spo2
             sensor_state["finger_on"] = finger_on
-        time.sleep(1) # wait before resending
+            print(f"Main core: BPM={sensor_state['bpm']}, SpO2={sensor_state['spo2']}, Finger on={sensor_state['finger_on']}")
+
+            now = utime.ticks_ms()
+            
+            if finger_on:
+                led.value(1)
+            else:
+                led.value(0)
+
+            # Buzzer alarm only if pulse is out of range
+            if finger_on and (bpm < PULS_MIN or bpm > PULS_MAX) and bpm != 0:
+                interval = 60.0 / bpm if bpm > 0 else 1
+                if last_beep_time == 0 or utime.ticks_diff(now, last_beep_time) > int(interval * 1000):
+                    alarma_on()
+                    alarm_on = True
+                    alarm_on_time = now
+                    last_beep_time = now
+            if alarm_on and utime.ticks_diff(now, alarm_on_time) > 70:
+                alarma_off()
+                alarm_on = False
+        else:
+            alarma_off()
+            led.value(0)
+            print("Main core: Sensor inactive, waiting...")
+        time.sleep(0.01)
 
 def second_core():
     global stop_flag
     wlan_ap = open_ap()
-    time.sleep(2)
+    time.sleep(1)
     run_web_server(wlan_ap)
 
 _thread.start_new_thread(second_core, ())
 
 try:
-    while True:
-        with stop_lock:
-            if stop_flag:
-                break
-        main_core()
+    main_core()
 except KeyboardInterrupt:
     with stop_lock:
         stop_flag = True
     print("Main thread stopping!")
+    alarma_off()
+    buzzer.deinit()
 
 time.sleep(1)
 print("Finished.")
